@@ -487,6 +487,11 @@ static void matmul_qt(float *y, const float *x, QT *w, int S){
             w->O,w->I,w->cuda_device);
     }
 #endif
+    if(!w->qf && !w->q8 && !w->q4){
+        fprintf(stderr,"FATAL: CPU matmul on a freed host tensor "
+            "(PIN_FREE_RAM=1 after a CUDA runtime failure). Rerun without PIN_FREE_RAM.\n");
+        exit(1);
+    }
     if(w->fmt==0){ matmul(y,x,w->qf,S,w->I,w->O); return; }
     /* int8 IDOT vince sempre (1.4-2.5x). int4 IDOT: l'autore su AVX2 trovo' che a S=1
      * non ripaga (soglia S>=2); ma su ARM/SDOT il singolo token CONVIENE (vedi g_i4s /
@@ -2015,6 +2020,22 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
  * persistent .coli_usage intact while adapting to the current workload. */
 static int g_repin=0;
 static uint64_t g_last_repin=0;
+/* PIN_FREE_RAM=1: dopo l'upload in VRAM di un expert pinnato, libera la copia host.
+ * Il tier CUDA e' upload-once (coli_cuda_tensor_upload non rilegge l'host); la RAM
+ * liberata torna a expert_avail() -> LRU piu' grande = piu' expert DISTINTI in cache.
+ * EN: after a pinned expert's VRAM upload, free its host copy. The CUDA tier is
+ * upload-once, and the freed bytes flow back through resident_bytes into a larger
+ * adaptive LRU — more DISTINCT experts cached. CPU fallback on such a tensor is
+ * fatal by design (see matmul_qt); a runtime CUDA failure there means rerun. */
+static int g_pin_free_ram=0;
+static int64_t pin_slot_free_host(ESlot *s){
+    int64_t fb=0;
+    if(s->slab){ fb+=s->slab_cap; compat_aligned_free(s->slab); s->slab=NULL; s->slab_cap=0; }
+    if(s->fslab){ fb+=(int64_t)s->fslab_cap*sizeof(float); free(s->fslab); s->fslab=NULL; s->fslab_cap=0; }
+    QT *qs[3]={&s->g,&s->u,&s->d};
+    for(int k=0;k<3;k++){ qs[k]->qf=NULL; qs[k]->q8=NULL; qs[k]->q4=NULL; qs[k]->s=NULL; }
+    return fb;
+}
 typedef struct { long gain; int l, slot, eid; } RepinCand;
 static int repin_pick(Model *m, RepinCand *out, int maxc){
     Cfg *c=&m->c; int nb=0;
@@ -2055,6 +2076,7 @@ static void repin_pass(Model *m){
                                +(int64_t)coli_cuda_tensor_bytes(s->u.cuda)
                                +(int64_t)coli_cuda_tensor_bytes(s->d.cuda);
                 m->gpu_expert_bytes+=now_gpu-old_gpu; tier="VRAM";
+                if(g_pin_free_ram) pin_slot_free_host(s);
             } else {
                 qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d);
                 s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=0;
@@ -2444,6 +2466,7 @@ static void pin_load(Model *m, const char *statspath, double gb){
     if(g_cuda_enabled && g_cuda_expert_gb>0){
         double remaining[COLI_CUDA_MAX_DEVICES]={0}, placed_b[COLI_CUDA_MAX_DEVICES]={0};
         int placed_n[COLI_CUDA_MAX_DEVICES]={0};
+        int64_t freed_host=0;
         double budget=g_cuda_expert_gb*1e9, safe_total=0;
         for(int i=0;i<g_cuda_ndev;i++){
             size_t free_b=0,total_b=0;
@@ -2478,6 +2501,7 @@ static void pin_load(Model *m, const char *statspath, double gb){
                         m->gpu_expert_count++; m->gpu_expert_bytes+=actual;
                         remaining[best]-=actual; placed_b[best]+=actual; placed_n[best]++;
                         placed=1;
+                        if(g_pin_free_ram) freed_host+=pin_slot_free_host(s);
                     } else {
                         qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d);
                         s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=0;
@@ -2491,6 +2515,11 @@ static void pin_load(Model *m, const char *statspath, double gb){
             m->gpu_expert_count,npin,m->gpu_expert_bytes/1e9,g_cuda_expert_gb);
         for(int i=0;i<g_cuda_ndev;i++) fprintf(stderr,"[CUDA]   device %d: %d experts, %.2f GB\n",
             g_cuda_devices[i],placed_n[i],placed_b[i]/1e9);
+        if(freed_host>0){
+            m->resident_bytes-=freed_host;   /* prima di cap_for_ram: la LRU eredita il budget */
+            fprintf(stderr,"[PIN] PIN_FREE_RAM: freed %.1f GB of host copies for %d VRAM-resident experts\n",
+                freed_host/1e9, m->gpu_expert_count);
+        }
     }
 #endif
     pin_wire(m);                                   /* inchioda in RAM (no compressione) / wire in RAM (no compression) */
@@ -2637,6 +2666,7 @@ int main(int argc, char **argv){
     const char *snap=getenv("SNAP"); if(!snap){fprintf(stderr,"SNAP=<dir>\n");return 1;}
     g_nopack = getenv("NOPACK")?1:0;
     g_drop = getenv("DROP")?1:0;
+    g_pin_free_ram = getenv("PIN_FREE_RAM")?atoi(getenv("PIN_FREE_RAM")):0;
     g_prefetch = getenv("PREFETCH")?atoi(getenv("PREFETCH")):0;
     g_topk = getenv("TOPK")?atoi(getenv("TOPK")):0;
     g_topp = getenv("TOPP")?atof(getenv("TOPP")):0;
